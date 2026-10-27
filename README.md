@@ -5,7 +5,7 @@ Hands-on labs for learning Linux, networking, and cloud fundamentals, built towa
 | Lab | Topic | Stack |
 |---|---|---|
 | [Lab 1](#lab-1--linux-router-with-nat) | Linux router (NAT + forwarding) between a home network and an isolated lab network | VirtualBox, Ubuntu Server, netplan, iptables |
-| [Lab 2](#lab-2--hybrid-cloud-site-to-site-ipsec-vpn) | Site-to-site IPsec VPN between the home lab and an AWS VPC | AWS (VPC, EC2, SSM), StrongSwan, Libreswan |
+| [Lab 2](#lab-2--hybrid-cloud-site-to-site-ipsec-vpn) | Site-to-site IPsec VPN between the home lab and an AWS VPC, reaching a private EC2 instance through it | AWS (VPC, EC2, SSM), StrongSwan, Libreswan |
 
 ---
 
@@ -50,7 +50,7 @@ Adapter vs router, Bridged / NAT / Internal / Host-only networking, static vs DH
 
 ## Lab 2 — Hybrid Cloud: Site-to-Site IPsec VPN
 
-**Goal:** Connect the Lab 1 network to a real AWS VPC over an IPsec tunnel, so lab machines can reach private cloud resources.
+**Goal:** Connect the Lab 1 network to a real AWS VPC over an IPsec tunnel, so lab machines can reach private cloud resources, and finish by logging in to an EC2 instance that has no public IP.
 
 ### Topology
 
@@ -68,6 +68,7 @@ client2 ┼── router-vm (StrongSwan) ═══ IPsec ═══╪═   192.1
 - **vpn-gw-01** responds, with `left` pinned to its private address and `right=%any` so the home IP can change.
 - Both ends use IKEv2 with a pre-shared key, AES-256 / SHA-256 / MODP2048.
 - vpn-gw-01 is managed through **SSM Session Manager** (IAM role, no SSH key, no open port 22).
+- lab-instance-01 has no internet path, so SSM can't reach it. I log in to it with an SSH key through the tunnel instead.
 
 ### AWS side
 
@@ -75,7 +76,14 @@ client2 ┼── router-vm (StrongSwan) ═══ IPsec ═══╪═   192.1
 - Internet gateway attached to the VPC, public subnet routed to it
 - Source/destination check disabled on `vpn-gw-01` (it forwards traffic not addressed to itself)
 - Security group on `vpn-gw-01`: UDP 500 and 4500 from the home public IP, all ICMP from `10.10.10.0/24`. The UDP 500 and 4500 rules are separate, so both must be updated when the home IP changes.
-- IAM role with `AmazonSSMManagedInstanceCore` attached to the instances
+- IAM role with `AmazonSSMManagedInstanceCore` attached to `vpn-gw-01`
+
+**What reaching `lab-instance-01` through the tunnel needs:**
+
+- IP forwarding on `vpn-gw-01` (`net.ipv4.ip_forward = 1`), so it passes tunnel traffic on to the private subnet
+- A route in the private subnet's route table: destination `10.10.10.0/24`, target `vpn-gw-01`, so replies find their way back into the tunnel
+- Security group on `lab-instance-01`: inbound all ICMP and SSH (22) from `10.10.10.0/24`
+- The instance's `.pem` key on the machine I connect from
 
 ### Configuration (sanitized)
 
@@ -147,6 +155,60 @@ sudo iptables -t nat -I POSTROUTING 1 -s 10.10.10.0/24 -d 192.168.0.0/24 -j ACCE
 sudo netfilter-persistent save
 ```
 
+### Starting the VPN each session
+
+I stop both instances at the end of each day. EC2 assigns a new public IP to `vpn-gw-01` on every start, so the router-vm config needs the new address each time.
+
+**1. In the EC2 console:** start `vpn-gw-01` and `lab-instance-01`, and copy `vpn-gw-01`'s new **Public IPv4 address**.
+
+**2. On vpn-gw-01 (Session Manager):** check the VPN service is running. It starts at boot.
+
+```bash
+sudo systemctl status ipsec        # should say: active (running)
+```
+
+**3. On router-vm:** point the config at the new address, then restart StrongSwan.
+
+```bash
+sudo sed -i 's/remote_addrs = .*/remote_addrs = NEW_PUBLIC_IP/' /etc/swanctl/swanctl.conf   # replace NEW_PUBLIC_IP with the real address
+sudo grep remote_addrs /etc/swanctl/swanctl.conf      # verify the change (sed prints nothing if it matched nothing)
+sudo systemctl stop strongswan
+sudo ip xfrm state flush           # clear leftover tunnel keys and rules from the previous day
+sudo ip xfrm policy flush
+sudo systemctl start strongswan
+sudo swanctl --load-all            # read the config into the running daemon
+```
+
+The config has `start_action = start`, so the tunnel dials by itself when StrongSwan starts. Running `sudo swanctl --initiate --child home-lab` as well just reports `not establishing CHILD_SA ... due to existing duplicate`, which means the tunnel is already up.
+
+**4. Check it:**
+
+```bash
+sudo swanctl --list-sas                        # want: ESTABLISHED, with the new address as remote
+ping -I 10.10.10.1 -c 4 192.168.0.37           # from router-vm; or ping 192.168.0.37 from client1
+```
+
+**5. If it doesn't come up,** the usual cause is the home IP. Compare `curl -4 ifconfig.me` (run on router-vm) with the source on `vpn-gw-01`'s security group, and update **both** the UDP 500 and UDP 4500 rules if it changed.
+
+### Reaching lab-instance-01
+
+From router-vm, with the tunnel up. The `-b` flag sets the source address to `10.10.10.1`, which is the address the tunnel carries. Without it, router-vm's own traffic leaves with its home address and never enters the tunnel.
+
+```bash
+ssh -b 10.10.10.1 -i ~/lab-instance-01-key.pem ec2-user@<LAB_INSTANCE_PRIVATE_IP>
+```
+
+If you can't connect, test the path first with `ping -I 10.10.10.1 -c 4 <LAB_INSTANCE_PRIVATE_IP>`:
+
+| Result | Likely cause |
+|---|---|
+| No replies, nothing shows up in `sudo tcpdump -i enX0 icmp -n` on vpn-gw-01 | Traffic isn't reaching vpn-gw-01: tunnel down, or `ip_forward` is `0` (check `sudo sysctl net.ipv4.ip_forward`; it can reset after a restart, as in Lab 1) |
+| Requests leave vpn-gw-01, no replies | Missing return route in the private subnet's route table, or lab-instance-01's security group is missing the ICMP/SSH rules |
+| Ping works, SSH times out | Security group is missing the SSH (22) rule from `10.10.10.0/24` |
+| `Permission denied (publickey)` | Wrong key or wrong username (`ec2-user` on Amazon Linux) |
+
+Copying the key to router-vm: run `scp` from the machine that has the file (for me, PowerShell on Windows). `No route to host` usually means the target VM is powered off.
+
 ### Problems solved
 
 | Symptom | Root cause | Fix |
@@ -161,7 +223,7 @@ sudo netfilter-persistent save
 | Ping through the tunnel sent 0 bytes | MASQUERADE rewrote the source address before IPsec could match it | NAT exemption rule above MASQUERADE |
 | Tunnel "established" but no replies | Stale SAs out of sync between the two daemons | Stopped both daemons, ran `ip xfrm state flush` and `ip xfrm policy flush`, re-established the tunnel |
 
-### Resuming the lab after a break (Oct 2026)
+### Troubleshooting after a break
 
 Coming back to the lab after a few weeks, the tunnel was down, and it took several rounds to find out why. Each of these looked like a different problem but came from the same two facts: the home IP changes, and EC2 gives a new public IP on every stop/start.
 
@@ -193,38 +255,33 @@ sudo ip xfrm policy                # kernel: which traffic gets encrypted
 sudo ip xfrm state                 # kernel: installed SAs and keys
 sudo ip -s xfrm state              # same, with packet counters
 cat /proc/net/xfrm_stat            # kernel: why IPsec packets were dropped
+sudo sysctl net.ipv4.ip_forward    # is forwarding on? (needs to be 1 on both gateways)
 sudo iptables -t nat -L -n -v --line-numbers
-sudo tcpdump -i enp0s3 udp port 4500 -n
+sudo tcpdump -i enp0s3 udp port 4500 -n    # router-vm: tunnel packets leaving
+sudo tcpdump -i enX0 icmp -n               # vpn-gw-01: pings arriving from the tunnel
 ```
 
 ### Concepts covered
 
 IPsec/IKEv2 basics, traffic selectors, NAT traversal, tunnel encapsulation (inner vs outer packets), source/destination checks, security groups, VPC routing, SSM Session Manager and IAM roles, interoperability between StrongSwan and Libreswan, kernel XFRM policy vs daemon state.
 
-Also: a tunnel is shared state held in memory on both ends, so one side can forget it while the other still shows it as up; a config file vs the state a service actually loaded; what a PSK does (authenticates the peers) and what it does not do (encrypt traffic); dynamic home IPs, and why Dynamic DNS does not help when security groups only accept IP ranges and the home side always initiates; AWS public IPv4 billing.
+Also: a tunnel is shared state held in memory on both ends, so one side can forget it while the other still shows it as up; a config file vs the state a service actually loaded; what a PSK does (authenticates the peers) and what it does not do (encrypt traffic); dynamic home IPs and why Dynamic DNS does not help when security groups only accept IP ranges and the home side always initiates; using an EC2 instance as a gateway (IP forwarding, source/destination check, a VPC route pointing at an instance); choosing the source address of a connection (`ping -I`, `ssh -b`) so it matches a tunnel's traffic selector; key-based SSH to a private instance; AWS public IPv4 billing.
 
 ### Status
 
 - [x] Tunnel established and passing traffic (router-vm to vpn-gw-01)
-- [x] `client1` reaches the VPC through router-vm (`client2` not tested yet)
-- [x] Stop hardcoding the home IP in Libreswan (`right=%any`)
-- [x] Rotate the PSK after it appeared in a chat log
-- [ ] Confirm the tunnel survives its first rekey (about an hour) without dropping
-- [ ] Consider `dpdaction=clear` on vpn-gw-01 (with `right=%any`, `restart` has no address to dial; untested)
-- [ ] Auto-update the security group's UDP 500 and 4500 rules when the home IP changes (scoped IAM user + script on router-vm)
-- [ ] Attach an Elastic IP to `vpn-gw-01` so its address survives stop/start
-- [ ] Reach `lab-instance-01` through the tunnel
-- [ ] Tighten security groups and review IAM permissions
-- [ ] Rebuild the VPC in Terraform
-- [ ] Turn on VPC Flow Logs and find tunnel traffic in them
+- [x] `client1` reaches the VPC through router-vm (`client2` not tested)
+- [x] Reached `lab-instance-01` (no public IP) over SSH through the tunnel
+- [x] Stopped hardcoding the home IP in Libreswan (`right=%any`)
+- [x] Rotated the PSK after it appeared in a chat log
 
 ---
 
 ## Cost notes
 
-- Public IPv4 addresses cost about $0.005/hour each (about $3.65/month), whether auto-assigned or Elastic. The free tier only covers them during an account's first 12 months, and only for EC2.
+- Public IPv4 addresses cost about $0.005/hour each (about $3.65/month). The free tier only covers them during an account's first 12 months, and only for EC2.
 - This lab runs in an account older than 12 months that belongs to an AWS Organization, so no free tier applies (the Billing Free Tier page is empty). Rough costs, which vary by region: about $8.50/month per `t2.micro` running 24/7, about $3.65/month for the public IP, and about $0.65/month per 8 GB disk. Stop instances when not in use.
-- An auto-assigned public IP is released when the instance stops, so it costs nothing while stopped but changes on the next start. An Elastic IP keeps the address but keeps billing while the instance is stopped.
+- An auto-assigned public IP is released when the instance stops, so it costs nothing while stopped. A new one is assigned on the next start, which is why `remote_addrs` is updated every session.
 - The AWS managed Site-to-Site VPN costs about $36/month per tunnel, so I used a self-managed tunnel instead.
 - Billing data lags by hours, so a budget alert warns after the fact. Set a low threshold.
 
@@ -233,5 +290,5 @@ Also: a tunnel is shared state held in memory on both ends, so one side can forg
 - Never commit PSKs, private keys, or `.pem` files. Keep them out of the repo folder entirely.
 - Config files in this repo use placeholders for the PSK and public IPs.
 - Treat any secret that appears in a log, chat, or screenshot as exposed, and rotate it.
-- Security group rules are scoped to a single `/32` instead of `0.0.0.0/0`.
-- If router-vm gets AWS credentials for an auto-update script, scope the IAM policy to one security group and the two actions needed to add and remove its rules.
+- Security group rules are scoped to a single `/32` (home IP) or the lab subnet (`10.10.10.0/24`) instead of `0.0.0.0/0`.
+- The private instance's `.pem` key lives only on router-vm. Delete it when the lab ends.
